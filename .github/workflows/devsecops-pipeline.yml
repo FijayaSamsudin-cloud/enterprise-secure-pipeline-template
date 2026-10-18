@@ -1,0 +1,540 @@
+name: Enterprise DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ "main", "release/*" ]
+  pull_request:
+    branches: [ "main", "release/*" ]
+  workflow_dispatch:
+    inputs:
+      security_gate_profile:
+        description: 'Profil Security Gate (audit | guarded | strict)'
+        required: true
+        default: 'guarded'
+        type: choice
+        options:
+          - audit
+          - guarded
+          - strict
+
+permissions: {}
+
+env:
+  IMAGE_NAME: app/production-test
+
+jobs:
+  # ==========================================
+  # JOB 0: VALIDASI KONFIGURASI PROFIL
+  # ==========================================
+  validate-config:
+    name: Validate Profile Configuration
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      security_profile: ${{ steps.set-profile.outputs.SECURITY_PROFILE }}
+    steps:
+      - name: Validate and Set Security Profile Environment
+        id: set-profile
+        env:
+          INPUT_PROFILE: ${{ github.event.inputs.security_gate_profile }}
+          REPO_PROFILE: ${{ vars.SECURITY_GATE_PROFILE }}
+        run: |
+          set +e
+          PROFILE="${INPUT_PROFILE:-${REPO_PROFILE:-guarded}}"
+          echo "Memvalidasi profil keamanan: $PROFILE"
+          if [[ "$PROFILE" != "audit" && "$PROFILE" != "guarded" && "$PROFILE" != "strict" ]]; then
+            echo "::error::[CONFIG ERROR] Profil '$PROFILE' tidak valid! Nilai resmi: audit, guarded, strict."
+            exit 1
+          fi
+          echo "SECURITY_PROFILE=$PROFILE" >> $GITHUB_OUTPUT
+          echo "Profil '$PROFILE' terverifikasi."
+          set -e
+
+  # ==========================================
+  # JOB 1: SECRET SCANNING (TruffleHog)
+  # ==========================================
+  secret-scanning:
+    name: Secret Scanning (TruffleHog)
+    needs: [validate-config]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SECURITY_PROFILE: ${{ needs.validate-config.outputs.security_profile }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@eef61447b9347a8b6f0235282912f4ed70d1885e # v4.2.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine Safe Commit Range
+        id: commit-range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set +e
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "SINCE_COMMIT=$PR_BASE" >> $GITHUB_OUTPUT
+            echo "UNTIL_COMMIT=$PR_HEAD" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "SINCE_COMMIT=${AFTER_SHA}~1" >> $GITHUB_OUTPUT
+            echo "UNTIL_COMMIT=$AFTER_SHA" >> $GITHUB_OUTPUT
+          else
+            if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] || [ -z "$BEFORE_SHA" ]; then
+              # Push Pertama: Kosongkan SINCE_COMMIT agar TruffleHog memindai dari root hingga UNTIL_COMMIT
+              echo "SINCE_COMMIT=" >> $GITHUB_OUTPUT
+            else
+              echo "SINCE_COMMIT=$BEFORE_SHA" >> $GITHUB_OUTPUT
+            fi
+            echo "UNTIL_COMMIT=$AFTER_SHA" >> $GITHUB_OUTPUT
+          fi
+          set -e
+
+      - name: Run TruffleHog CLI Scan
+        id: run-trufflehog
+        env:
+          SINCE_COMMIT: ${{ steps.commit-range.outputs.SINCE_COMMIT }}
+          UNTIL_COMMIT: ${{ steps.commit-range.outputs.UNTIL_COMMIT }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set +e
+          if [ -n "$SINCE_COMMIT" ]; then
+            docker run --rm -v "$PWD:/path" trufflesecurity/trufflehog:3.88.15 \
+              git file:///path \
+              --since-commit="$SINCE_COMMIT" \
+              --until-commit="$UNTIL_COMMIT" \
+              --branch="$TARGET_BRANCH" \
+              --json > trufflehog-ndjson.json 2> trufflehog-stderr.log
+          else
+            docker run --rm -v "$PWD:/path" trufflesecurity/trufflehog:3.88.15 \
+              git file:///path \
+              --until-commit="$UNTIL_COMMIT" \
+              --branch="$TARGET_BRANCH" \
+              --json > trufflehog-ndjson.json 2> trufflehog-stderr.log
+          fi
+          CLI_EXIT=$?
+          echo "CLI_EXIT_CODE=$CLI_EXIT" >> $GITHUB_OUTPUT
+          set -e
+
+      - name: Strict Schema Sanitize TruffleHog Report
+        if: always()
+        run: |
+          set +e
+          if [ -s trufflehog-ndjson.json ]; then
+            jq -s -c '
+              if type == "array" then
+                if all(.[] | (has("DetectorName") and (.DetectorName | type == "string") and (has("Verified") and (.Verified == true or .Verified == false or .Verified == null)))) then
+                  [ .[] | {
+                    DetectorName: .DetectorName,
+                    Verified: .Verified,
+                    DecoderName: (.DecoderName // "Unknown"),
+                    Commit: (.SourceMetadata.Data.Git.commit // "Unknown")
+                  }]
+                else
+                  "SCHEMA_ERROR"
+                fi
+              else
+                "SCHEMA_ERROR"
+              fi
+            ' trufflehog-ndjson.json > trufflehog-sanitized.json 2>/dev/null || echo '"SCHEMA_ERROR"' > trufflehog-sanitized.json
+          else
+            echo "[]" > trufflehog-sanitized.json
+          fi
+          set -e
+
+      - name: Upload Sanitized Secret Artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: trufflehog-sanitized-report
+          path: trufflehog-sanitized.json
+          retention-days: 14
+
+      - name: Evaluate Secret Security Gate
+        run: |
+          CLI_EXIT="${{ steps.run-trufflehog.outputs.CLI_EXIT_CODE }}"
+          if [ -z "$CLI_EXIT" ] || [ "$CLI_EXIT" -ne 0 ]; then
+            echo "::error::[SCANNER ERROR] TruffleHog CLI gagal dieksekusi (Exit Code: $CLI_EXIT)."
+            cat trufflehog-stderr.log 2>/dev/null || true
+            exit 1
+          fi
+
+          if [ ! -f trufflehog-sanitized.json ] || grep -q "SCHEMA_ERROR" trufflehog-sanitized.json; then
+            echo "::error::[SCHEMA ERROR] Output TruffleHog merusak aturan tipe skema valid!"
+            exit 1
+          fi
+
+          VERIFIED_COUNT=$(jq '[.[] | select(.Verified == true)] | length' trufflehog-sanitized.json)
+          UNVERIFIED_COUNT=$(jq '[.[] | select(.Verified == false)] | length' trufflehog-sanitized.json)
+          UNKNOWN_COUNT=$(jq '[.[] | select(.Verified == null)] | length' trufflehog-sanitized.json)
+
+          echo "Hasil TruffleHog: Verified=$VERIFIED_COUNT, Unverified=$UNVERIFIED_COUNT, Unknown=$UNKNOWN_COUNT"
+          PROFILE="${{ env.SECURITY_PROFILE }}"
+
+          if [ "$PROFILE" = "guarded" ]; then
+            if [ "$VERIFIED_COUNT" -gt 0 ]; then
+              echo "::error::[SECURITY GATE] Terdeteksi $VERIFIED_COUNT Verified Secret aktif!"
+              exit 1
+            fi
+          elif [ "$PROFILE" = "strict" ]; then
+            TOTAL_SECRETS=$((VERIFIED_COUNT + UNVERIFIED_COUNT + UNKNOWN_COUNT))
+            if [ "$TOTAL_SECRETS" -gt 0 ]; then
+              echo "::error::[SECURITY GATE] Terdeteksi $TOTAL_SECRETS temuan secret (Verified/Unverified/Unknown)!"
+              exit 1
+            fi
+          else
+            echo "[AUDIT MODE] Laporan disimpan, pipeline dilanjutkan."
+          fi
+
+  # ==========================================
+  # JOB 2: SAST ANALYSIS (Semgrep CLI)
+  # ==========================================
+  sast-analysis:
+    name: SAST Analysis (Semgrep)
+    needs: [validate-config]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SECURITY_PROFILE: ${{ needs.validate-config.outputs.security_profile }}
+    container:
+      image: semgrep/semgrep:1.98.0
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@eef61447b9347a8b6f0235282912f4ed70d1885e # v4.2.1
+        with:
+          persist-credentials: false
+
+      - name: Execute Semgrep Scan (JSON & SARIF)
+        id: run-semgrep
+        run: |
+          set +e
+          semgrep scan --config "p/security-audit" --config "p/secrets" --json --output semgrep-results.json 2> semgrep-stderr.log
+          JSON_EXIT=$?
+          semgrep scan --config "p/security-audit" --config "p/secrets" --sarif --output semgrep.sarif 2>> semgrep-stderr.log
+          SARIF_EXIT=$?
+
+          echo "JSON_EXIT_CODE=$JSON_EXIT" >> $GITHUB_OUTPUT
+          echo "SARIF_EXIT_CODE=$SARIF_EXIT" >> $GITHUB_OUTPUT
+          set -e
+
+      - name: Upload Semgrep Artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: semgrep-sast-reports
+          path: |
+            semgrep-results.json
+            semgrep.sarif
+          retention-days: 14
+
+      - name: Evaluate SAST Security Gate
+        run: |
+          JSON_EXIT="${{ steps.run-semgrep.outputs.JSON_EXIT_CODE }}"
+          if [ -z "$JSON_EXIT" ] || [ "$JSON_EXIT" -ne 0 ]; then
+            echo "::error::[SCANNER ERROR] Semgrep CLI gagal dieksekusi (Exit Code: $JSON_EXIT)."
+            cat semgrep-stderr.log 2>/dev/null || true
+            exit 1
+          fi
+
+          if [ ! -s semgrep-results.json ] || ! jq empty semgrep-results.json 2>/dev/null; then
+            echo "::error::[SCANNER ERROR] File JSON Semgrep tidak ditemukan atau rusak."
+            exit 1
+          fi
+
+          VALID_SCHEMA=$(jq -e '
+            has("results") and (.results | type == "array") and
+            has("errors") and (.errors | type == "array") and
+            all(.results[]; .extra | has("severity") and (.severity | type == "string"))
+          ' semgrep-results.json 2>/dev/null || echo "false")
+
+          if [ "$VALID_SCHEMA" != "true" ]; then
+            echo "::error::[SCHEMA ERROR] Skema JSON Semgrep tidak valid!"
+            exit 1
+          fi
+
+          UNKNOWN_SEV=$(jq '[.results[]? | select(.extra.severity as $s | ["CRITICAL","HIGH","ERROR","MEDIUM","WARNING","LOW","INFO"] | contains([$s]) | not)] | length' semgrep-results.json)
+          if [ "$UNKNOWN_SEV" -gt 0 ]; then
+            echo "::error::[SCHEMA ERROR] Terdeteksi $UNKNOWN_SEV temuan Semgrep dengan severity tidak dikenal!"
+            exit 1
+          fi
+
+          CRIT_COUNT=$(jq '[.results[]? | select(.extra.severity == "CRITICAL")] | length' semgrep-results.json)
+          HIGH_COUNT=$(jq '[.results[]? | select(.extra.severity == "HIGH")] | length' semgrep-results.json)
+          ERR_COUNT=$(jq '[.results[]? | select(.extra.severity == "ERROR")] | length' semgrep-results.json)
+          MED_COUNT=$(jq '[.results[]? | select(.extra.severity == "MEDIUM")] | length' semgrep-results.json)
+          WARN_COUNT=$(jq '[.results[]? | select(.extra.severity == "WARNING")] | length' semgrep-results.json)
+          LOW_COUNT=$(jq '[.results[]? | select(.extra.severity == "LOW")] | length' semgrep-results.json)
+          INFO_COUNT=$(jq '[.results[]? | select(.extra.severity == "INFO")] | length' semgrep-results.json)
+
+          echo "Hasil SAST: CRITICAL=$CRIT_COUNT, HIGH=$HIGH_COUNT, ERROR=$ERR_COUNT, MEDIUM=$MED_COUNT, WARNING=$WARN_COUNT, LOW=$LOW_COUNT, INFO=$INFO_COUNT"
+          PROFILE="${{ env.SECURITY_PROFILE }}"
+
+          GUARDED_FAILURES=$((CRIT_COUNT + HIGH_COUNT + ERR_COUNT))
+          STRICT_FAILURES=$((GUARDED_FAILURES + MED_COUNT + WARN_COUNT + LOW_COUNT))
+
+          if [ "$PROFILE" = "guarded" ] && [ "$GUARDED_FAILURES" -gt 0 ]; then
+            echo "::error::[SECURITY GATE] Terdeteksi $GUARDED_FAILURES temuan SAST kriteria Tinggi (CRITICAL/HIGH/ERROR)!"
+            exit 1
+          elif [ "$PROFILE" = "strict" ] && [ "$STRICT_FAILURES" -gt 0 ]; then
+            echo "::error::[SECURITY GATE] Terdeteksi $STRICT_FAILURES temuan SAST kriteria Ketat!"
+            exit 1
+          else
+            echo "[AUDIT MODE] Temuan dicatat, pipeline dilanjutkan."
+          fi
+
+  # ==========================================
+  # JOB 3: SCA & DEPENDENCY SCANNING (Trivy)
+  # ==========================================
+  dependency-check:
+    name: SCA & Filesystem Scan (Trivy)
+    needs: [validate-config]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SECURITY_PROFILE: ${{ needs.validate-config.outputs.security_profile }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@eef61447b9347a8b6f0235282912f4ed70d1885e # v4.2.1
+        with:
+          persist-credentials: false
+
+      - name: Run Trivy FS Scan (JSON & SARIF)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.29.0
+        id: run-trivy-fs
+        continue-on-error: true
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'json'
+          output: 'trivy-fs.json'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Generate Trivy FS SARIF Report
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.29.0
+        id: run-trivy-fs-sarif
+        continue-on-error: true
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Upload Dependency Artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: trivy-dependency-reports
+          path: |
+            trivy-fs.json
+            trivy-fs.sarif
+          retention-days: 14
+
+      - name: Evaluate Dependency Security Gate
+        run: |
+          TRIVY_OUT="${{ steps.run-trivy-fs.outcome }}"
+          if [ "$TRIVY_OUT" != "success" ]; then
+            echo "::error::[SCANNER ERROR] Action Trivy FS mengalami kegagalan operasional."
+            exit 1
+          fi
+
+          if [ ! -s trivy-fs.json ] || ! jq empty trivy-fs.json 2>/dev/null; then
+            echo "::error::[SCANNER ERROR] File JSON Trivy FS tidak ada atau tidak valid."
+            exit 1
+          fi
+
+          VALID_SCHEMA=$(jq -e '
+            has("Results") and (.Results == null or (.Results | type == "array" and
+            all(.Results[]; .Target | type == "string" and (.Vulnerabilities == null or (.Vulnerabilities | type == "array" and all(.Vulnerabilities[]; .Severity | type == "string"))))))
+          ' trivy-fs.json 2>/dev/null || echo "false")
+
+          if [ "$VALID_SCHEMA" != "true" ]; then
+            echo "::error::[SCHEMA ERROR] Skema JSON Trivy FS tidak valid!"
+            exit 1
+          fi
+
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-fs.json)
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-fs.json)
+          echo "Hasil Pemindaian Dependensi: CRITICAL=$CRITICAL_COUNT, HIGH=$HIGH_COUNT"
+
+          PROFILE="${{ env.SECURITY_PROFILE }}"
+
+          if [ "$PROFILE" = "guarded" ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "::error::[SECURITY GATE] Terdeteksi $CRITICAL_COUNT kerentanan CRITICAL pada dependensi!"
+            exit 1
+          elif [ "$PROFILE" = "strict" ]; then
+            TOTAL_VULN=$((CRITICAL_COUNT + HIGH_COUNT))
+            if [ "$TOTAL_VULN" -gt 0 ]; then
+              echo "::error::[SECURITY GATE] Terdeteksi $TOTAL_VULN kerentanan HIGH/CRITICAL pada dependensi!"
+              exit 1
+            fi
+          else
+            echo "[AUDIT MODE] Laporan disimpan, pipeline dilanjutkan."
+          fi
+
+  # ==========================================
+  # JOB 4: CONTAINER IMAGE SECURITY SCAN
+  # ==========================================
+  container-security:
+    name: Container Image Scan (Trivy)
+    needs: [validate-config]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SECURITY_PROFILE: ${{ needs.validate-config.outputs.security_profile }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@eef61447b9347a8b6f0235282912f4ed70d1885e # v4.2.1
+        with:
+          persist-credentials: false
+
+      - name: Build Local Test Image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Scan Container Image (JSON)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.29.0
+        id: run-trivy-img
+        continue-on-error: true
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'json'
+          output: 'trivy-image.json'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Scan Container Image (SARIF)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.29.0
+        id: run-trivy-img-sarif
+        continue-on-error: true
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Upload Container Artifacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: always()
+        with:
+          name: trivy-container-reports
+          path: |
+            trivy-image.json
+            trivy-image.sarif
+          retention-days: 14
+
+      - name: Evaluate Container Security Gate
+        run: |
+          TRIVY_OUT="${{ steps.run-trivy-img.outcome }}"
+          if [ "$TRIVY_OUT" != "success" ]; then
+            echo "::error::[SCANNER ERROR] Action Trivy Image mengalami kegagalan operasional."
+            exit 1
+          fi
+
+          if [ ! -s trivy-image.json ] || ! jq empty trivy-image.json 2>/dev/null; then
+            echo "::error::[SCANNER ERROR] File JSON Trivy Image tidak ada atau tidak valid."
+            exit 1
+          fi
+
+          VALID_SCHEMA=$(jq -e '
+            has("Results") and (.Results == null or (.Results | type == "array" and
+            all(.Results[]; .Target | type == "string" and (.Vulnerabilities == null or (.Vulnerabilities | type == "array" and all(.Vulnerabilities[]; .Severity | type == "string"))))))
+          ' trivy-image.json 2>/dev/null || echo "false")
+
+          if [ "$VALID_SCHEMA" != "true" ]; then
+            echo "::error::[SCHEMA ERROR] Skema JSON Trivy Image tidak valid."
+            exit 1
+          fi
+
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-image.json)
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-image.json)
+          echo "Hasil Pemindaian Container Image: CRITICAL=$CRITICAL_COUNT, HIGH=$HIGH_COUNT"
+
+          PROFILE="${{ env.SECURITY_PROFILE }}"
+
+          if [ "$PROFILE" = "guarded" ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "::error::[SECURITY GATE] Terdeteksi $CRITICAL_COUNT kerentanan CRITICAL pada Container Image!"
+            exit 1
+          elif [ "$PROFILE" = "strict" ]; then
+            TOTAL_VULN=$((CRITICAL_COUNT + HIGH_COUNT))
+            if [ "$TOTAL_VULN" -gt 0 ]; then
+              echo "::error::[SECURITY GATE] Terdeteksi $TOTAL_VULN kerentanan HIGH/CRITICAL pada Container Image!"
+              exit 1
+            fi
+          else
+            echo "[AUDIT MODE] Laporan disimpan, pipeline dilanjutkan."
+          fi
+
+  # ==========================================
+  # JOB 5: ISOLATED SARIF UPLOAD (Structurally Validated)
+  # ==========================================
+  upload-sarif-reports:
+    name: Upload SARIF Reports to GitHub Security
+    needs: [sast-analysis, dependency-check, container-security]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download SAST Artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        continue-on-error: true
+        with:
+          name: semgrep-sast-reports
+          path: sarif-downloads/semgrep
+
+      - name: Download Dependency Artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        continue-on-error: true
+        with:
+          name: trivy-dependency-reports
+          path: sarif-downloads/trivy-deps
+
+      - name: Download Container Artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        continue-on-error: true
+        with:
+          name: trivy-container-reports
+          path: sarif-downloads/trivy-container
+
+      - name: Validate & Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@f09c1c0d950f229a7d096b797db3365966191fe1 # v3.27.5
+        continue-on-error: true
+        if: |
+          hashFiles('sarif-downloads/semgrep/semgrep.sarif') != '' &&
+          contains(fromJSON('["2.1.0"]'), jq -r '.version // empty' sarif-downloads/semgrep/semgrep.sarif 2>/dev/null)
+        with:
+          sarif_file: sarif-downloads/semgrep/semgrep.sarif
+          category: semgrep-sast
+
+      - name: Validate & Upload Trivy FS SARIF
+        uses: github/codeql-action/upload-sarif@f09c1c0d950f229a7d096b797db3365966191fe1 # v3.27.5
+        continue-on-error: true
+        if: |
+          hashFiles('sarif-downloads/trivy-deps/trivy-fs.sarif') != '' &&
+          contains(fromJSON('["2.1.0"]'), jq -r '.version // empty' sarif-downloads/trivy-deps/trivy-fs.sarif 2>/dev/null)
+        with:
+          sarif_file: sarif-downloads/trivy-deps/trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Validate & Upload Trivy Image SARIF
+        uses: github/codeql-action/upload-sarif@f09c1c0d950f229a7d096b797db3365966191fe1 # v3.27.5
+        continue-on-error: true
+        if: |
+          hashFiles('sarif-downloads/trivy-container/trivy-image.sarif') != '' &&
+          contains(fromJSON('["2.1.0"]'), jq -r '.version // empty' sarif-downloads/trivy-container/trivy-image.sarif 2>/dev/null)
+        with:
+          sarif_file: sarif-downloads/trivy-container/trivy-image.sarif
+          category: trivy-container

@@ -509,32 +509,55 @@ jobs:
           name: trivy-container-reports
           path: sarif-downloads/trivy-container
 
-      - name: Validate & Upload Semgrep SARIF
+      - name: Validate SARIF Files Structure
+        id: validate-sarif
+        run: |
+          set +e
+          # Validasi Semgrep SARIF
+          SEMGREP_FILE="sarif-downloads/semgrep/semgrep.sarif"
+          if [ -s "$SEMGREP_FILE" ] && jq -e '.version == "2.1.0" and (has("runs") and (.runs | type == "array"))' "$SEMGREP_FILE" >/dev/null 2>&1; then
+            echo "SEMGREP_VALID=true" >> $GITHUB_OUTPUT
+          else
+            echo "SEMGREP_VALID=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Validasi Trivy FS SARIF
+          TRIVY_FS_FILE="sarif-downloads/trivy-deps/trivy-fs.sarif"
+          if [ -s "$TRIVY_FS_FILE" ] && jq -e '.version == "2.1.0" and (has("runs") and (.runs | type == "array"))' "$TRIVY_FS_FILE" >/dev/null 2>&1; then
+            echo "TRIVY_FS_VALID=true" >> $GITHUB_OUTPUT
+          else
+            echo "TRIVY_FS_VALID=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Validasi Trivy Image SARIF
+          TRIVY_IMG_FILE="sarif-downloads/trivy-container/trivy-image.sarif"
+          if [ -s "$TRIVY_IMG_FILE" ] && jq -e '.version == "2.1.0" and (has("runs") and (.runs | type == "array"))' "$TRIVY_IMG_FILE" >/dev/null 2>&1; then
+            echo "TRIVY_IMG_VALID=true" >> $GITHUB_OUTPUT
+          else
+            echo "TRIVY_IMG_VALID=false" >> $GITHUB_OUTPUT
+          fi
+          set -e
+
+      - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@f09c1c0d950f229a7d096b797db3365966191fe1 # v3.27.5
         continue-on-error: true
-        if: |
-          hashFiles('sarif-downloads/semgrep/semgrep.sarif') != '' &&
-          contains(fromJSON('["2.1.0"]'), jq -r '.version // empty' sarif-downloads/semgrep/semgrep.sarif 2>/dev/null)
+        if: steps.validate-sarif.outputs.SEMGREP_VALID == 'true'
         with:
           sarif_file: sarif-downloads/semgrep/semgrep.sarif
           category: semgrep-sast
 
-      - name: Validate & Upload Trivy FS SARIF
+      - name: Upload Trivy FS SARIF
         uses: github/codeql-action/upload-sarif@f09c1c0d950f229a7d096b797db3365966191fe1 # v3.27.5
         continue-on-error: true
-        if: |
-          hashFiles('sarif-downloads/trivy-deps/trivy-fs.sarif') != '' &&
-          contains(fromJSON('["2.1.0"]'), jq -r '.version // empty' sarif-downloads/trivy-deps/trivy-fs.sarif 2>/dev/null)
+        if: steps.validate-sarif.outputs.TRIVY_FS_VALID == 'true'
         with:
           sarif_file: sarif-downloads/trivy-deps/trivy-fs.sarif
           category: trivy-fs
 
-      - name: Validate & Upload Trivy Image SARIF
+      - name: Upload Trivy Image SARIF
         uses: github/codeql-action/upload-sarif@f09c1c0d950f229a7d096b797db3365966191fe1 # v3.27.5
         continue-on-error: true
-        if: |
-          hashFiles('sarif-downloads/trivy-container/trivy-image.sarif') != '' &&
-          contains(fromJSON('["2.1.0"]'), jq -r '.version // empty' sarif-downloads/trivy-container/trivy-image.sarif 2>/dev/null)
+        if: steps.validate-sarif.outputs.TRIVY_IMG_VALID == 'true'
         with:
           sarif_file: sarif-downloads/trivy-container/trivy-image.sarif
           category: trivy-container
